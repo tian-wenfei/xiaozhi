@@ -1,0 +1,7 @@
+build/
+*.bin
+*.elf
+*.map
+secrets.h
+.vscode/
+.DS_Store

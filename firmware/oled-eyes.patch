@@ -1,0 +1,1338 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 39da62d..8b9559a 100755
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,6 +2,9 @@
+ # CMakeLists in this exact order for cmake to work correctly
+ cmake_minimum_required(VERSION 3.16)
+ 
++# Windows: use response files to avoid the 32K command-line length limit
++set(CMAKE_NINJA_FORCE_RESPONSE_FILE ON)
++
+ # Add this line to disable the specific warning
+ add_compile_options(-Wno-missing-field-initializers)
+ 
+diff --git a/main/display/oled_display.cc b/main/display/oled_display.cc
+index 640f4fc..9247e01 100644
+--- a/main/display/oled_display.cc
++++ b/main/display/oled_display.cc
+@@ -5,10 +5,13 @@
+ #include "settings.h"
+ 
+ #include <algorithm>
++#include <cstring>
++#include <math.h>
+ #include <string>
+ 
+ #include <esp_err.h>
+ #include <esp_log.h>
++#include <esp_random.h>
+ #include <esp_lvgl_port.h>
+ #include <material_symbols.h>
+ #include <noto_emoji.h>
+@@ -20,6 +23,18 @@ LV_FONT_DECLARE(BUILTIN_ICON_FONT);
+ LV_FONT_DECLARE(font_material_symbols_30_1);
+ LV_FONT_DECLARE(font_noto_emoji_30_1);
+ 
++namespace {
++
++// Geometry of the 128x64 face, in screen pixels: two small eyes and a mouth,
++// sitting a little above the vertical center of the panel.
++constexpr int kEyeLx = 46;
++constexpr int kEyeRx = 82;
++constexpr int kEyeCy = 26;
++constexpr int kMouthCx = 64;
++constexpr int kMouthCy = 47;
++
++}  // namespace
++
+ OledDisplay::OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel,
+                          int width, int height, bool mirror_x, bool mirror_y)
+     : panel_io_(panel_io), panel_(panel) {
+@@ -103,6 +118,51 @@ void OledDisplay::SetupUI() {
+ }
+ 
+ OledDisplay::~OledDisplay() {
++    if (eyes_timer_ != nullptr) {
++        lv_timer_del(eyes_timer_);
++        eyes_timer_ = nullptr;
++    }
++    if (face_timer_ != nullptr) {
++        lv_timer_del(face_timer_);
++        face_timer_ = nullptr;
++    }
++    if (face_container_ != nullptr) {
++        lv_obj_del(face_container_);
++        face_container_ = nullptr;
++        eye_left_ = nullptr;
++        eye_right_ = nullptr;
++        smile_l_ = nullptr;
++        smile_r_ = nullptr;
++        brow_left_ = nullptr;
++        brow_right_ = nullptr;
++        blush_left_ = nullptr;
++        blush_right_ = nullptr;
++        tear_left_ = nullptr;
++        tear_left2_ = nullptr;
++        tear_right_ = nullptr;
++        tear_right2_ = nullptr;
++        sweat_ = nullptr;
++        for (int i = 0; i < 2; i++) {
++            heart_lobe_[i][0] = nullptr;
++            heart_lobe_[i][1] = nullptr;
++            heart_tip_[i] = nullptr;
++        }
++        for (int i = 0; i < 3; i++) {
++            sparkle_[i] = nullptr;
++            thought_dots_[i] = nullptr;
++            zzz_labels_[i] = nullptr;
++        }
++        swirl_ = nullptr;
++        exclaim_bar_ = nullptr;
++        exclaim_dot_ = nullptr;
++        question_ = nullptr;
++        anger_a_ = nullptr;
++        anger_b_ = nullptr;
++        mouth_line_ = nullptr;
++        mouth_fill_ = nullptr;
++        tongue_ = nullptr;
++    }
++
+     if (content_ != nullptr) {
+         lv_obj_del(content_);
+     }
+@@ -148,6 +208,20 @@ void OledDisplay::Unlock() { lvgl_port_unlock(); }
+ 
+ void OledDisplay::SetChatMessage(const char* role, const char* content) {
+     DisplayLockGuard lock(this);
++
++    // The cloud often labels playful "dizzy" replies as "happy". The sentence
++    // text is the reliable signal, so scan the assistant's reply for it.
++    if (role != nullptr && content != nullptr && strcmp(role, "assistant") == 0) {
++        static const char* kDizzyWords[] = {"头晕", "晕", "头昏", "天旋地转", "转圈"};
++        for (const char* word : kDizzyWords) {
++            if (strstr(content, word) != nullptr) {
++                SetFace(Face::DIZZY);
++                emotion_hold_until_ = lv_tick_get() + 6000;
++                break;
++            }
++        }
++    }
++
+     if (chat_message_label_ == nullptr) {
+         return;
+     }
+@@ -167,6 +241,8 @@ void OledDisplay::SetChatMessage(const char* role, const char* content) {
+             lv_obj_remove_flag(content_right_, LV_OBJ_FLAG_HIDDEN);
+         }
+     }
++
++    SetTextModeInternal(status_hold_ || notification_active_);
+ }
+ 
+ void OledDisplay::SetupUI_128x64() {
+@@ -302,6 +378,9 @@ void OledDisplay::SetupUI_128x64() {
+     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
+     lv_obj_center(low_battery_label_);
+     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
++
++    SetupFace();
++    SetTextModeInternal(false);
+ }
+ 
+ void OledDisplay::SetupUI_128x32() {
+@@ -401,6 +480,65 @@ void OledDisplay::SetEmotion(const char* emotion) {
+         emotion_font = lvgl_theme->large_icon_font()->font();
+     }
+     DisplayLockGuard lock(this);
++
++    Face face = Face::IDLE;
++    if (emotion != nullptr) {
++        if (strcmp(emotion, "happy") == 0) {
++            face = Face::HAPPY;
++        } else if (strcmp(emotion, "laughing") == 0 || strcmp(emotion, "funny") == 0) {
++            face = Face::LAUGHING;
++        } else if (strcmp(emotion, "loving") == 0) {
++            face = Face::LOVING;
++        } else if (strcmp(emotion, "kissy") == 0) {
++            face = Face::KISSY;
++        } else if (strcmp(emotion, "winking") == 0) {
++            face = Face::WINKING;
++        } else if (strcmp(emotion, "silly") == 0) {
++            face = Face::SILLY;
++        } else if (strcmp(emotion, "delicious") == 0) {
++            face = Face::DELICIOUS;
++        } else if (strcmp(emotion, "confident") == 0) {
++            face = Face::CONFIDENT;
++        } else if (strcmp(emotion, "sad") == 0) {
++            face = Face::SAD;
++        } else if (strcmp(emotion, "crying") == 0) {
++            face = Face::CRYING;
++        } else if (strcmp(emotion, "angry") == 0) {
++            face = Face::ANGRY;
++        } else if (strcmp(emotion, "sleepy") == 0) {
++            face = Face::SLEEPY;
++        } else if (strcmp(emotion, "tired") == 0) {
++            face = Face::TIRED;
++        } else if (strcmp(emotion, "relaxed") == 0) {
++            face = Face::RELAXED;
++        } else if (strcmp(emotion, "thinking") == 0) {
++            face = Face::THINKING;
++        } else if (strcmp(emotion, "surprised") == 0) {
++            face = Face::SURPRISED;
++        } else if (strcmp(emotion, "shocked") == 0) {
++            face = Face::SHOCKED;
++        } else if (strcmp(emotion, "confused") == 0) {
++            face = Face::CONFUSED;
++        } else if (strcmp(emotion, "dizzy") == 0 || strcmp(emotion, "headache") == 0 ||
++                   strcmp(emotion, "vertigo") == 0 || strcmp(emotion, "spinning") == 0) {
++            face = Face::DIZZY;
++        } else if (strcmp(emotion, "embarrassed") == 0) {
++            face = Face::EMBARRASSED;
++        } else if (strcmp(emotion, "shy") == 0) {
++            face = Face::SHY;
++        }
++    }
++    // The application resets the expression to "neutral" on every state change
++    // (speaking -> idle, listening, connecting). Keep an expressive face on
++    // screen for a few seconds after the reply instead of dropping it instantly.
++    if (face != Face::IDLE) {
++        emotion_hold_until_ = lv_tick_get() + 6000;
++        SetFace(face);
++    } else if ((int32_t)(lv_tick_get() - emotion_hold_until_) >= 0) {
++        SetFace(Face::IDLE);
++    }
++    ESP_LOGI(TAG, "SetEmotion('%s')", emotion != nullptr ? emotion : "");
++
+     if (emotion_label_ == nullptr) {
+         return;
+     }
+@@ -423,6 +561,987 @@ void OledDisplay::SetTheme(Theme* theme) {
+     lv_obj_set_style_text_font(screen, text_font, 0);
+ }
+ 
++void OledDisplay::SetStatus(const char* status) {
++    LvglDisplay::SetStatus(status);
++
++    DisplayLockGuard lock(this);
++    const bool was_listening = listening_;
++    speaking_ = (status != nullptr && strcmp(status, Lang::Strings::SPEAKING) == 0);
++    listening_ = (status != nullptr && strcmp(status, Lang::Strings::LISTENING) == 0);
++    if (listening_ && !was_listening) {
++        // A new conversation starts: drop the lingering expression so the
++        // listening eyes are visible immediately.
++        emotion_hold_until_ = 0;
++        SetFace(Face::IDLE);
++    }
++    bool hold = false;
++    if (status != nullptr) {
++        hold = (strcmp(status, Lang::Strings::ACTIVATION) == 0 ||
++                strcmp(status, Lang::Strings::REGISTERING_NETWORK) == 0 ||
++                strcmp(status, Lang::Strings::WIFI_CONFIG_MODE) == 0);
++    }
++    status_hold_ = hold;
++    SetTextModeInternal(status_hold_ || notification_active_);
++}
++
++void OledDisplay::ShowNotification(const char* notification, int duration_ms) {
++    LvglDisplay::ShowNotification(notification, duration_ms);
++
++    DisplayLockGuard lock(this);
++    notification_active_ = true;
++    SetTextModeInternal(true);
++
++    if (eyes_timer_ != nullptr) {
++        lv_timer_del(eyes_timer_);
++        eyes_timer_ = nullptr;
++    }
++    int ms = duration_ms > 0 ? duration_ms : 3000;
++    eyes_timer_ = lv_timer_create(NotificationTimerCb, ms, this);
++    if (eyes_timer_ != nullptr) {
++        lv_timer_set_repeat_count(eyes_timer_, 1);
++    }
++}
++
++void OledDisplay::SetTextModeInternal(bool on) {
++    text_mode_ = on;
++    if (face_container_ != nullptr) {
++        if (on) {
++            lv_obj_add_flag(face_container_, LV_OBJ_FLAG_HIDDEN);
++        } else {
++            lv_obj_remove_flag(face_container_, LV_OBJ_FLAG_HIDDEN);
++            ApplyFacePose();
++            blink_at_ = tick_ + 40;
++        }
++    }
++    if (container_ != nullptr) {
++        if (on) {
++            lv_obj_remove_flag(container_, LV_OBJ_FLAG_HIDDEN);
++        } else {
++            lv_obj_add_flag(container_, LV_OBJ_FLAG_HIDDEN);
++        }
++    }
++    if (status_bar_ != nullptr) {
++        if (on) {
++            lv_obj_remove_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++        } else {
++            lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
++        }
++    }
++}
++
++void OledDisplay::SetupFace() {
++    auto screen = lv_screen_active();
++    face_container_ = lv_obj_create(screen);
++    lv_obj_set_size(face_container_, LV_HOR_RES, LV_VER_RES);
++    lv_obj_set_style_bg_opa(face_container_, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(face_container_, 0, 0);
++    lv_obj_set_style_pad_all(face_container_, 0, 0);
++    lv_obj_set_scrollbar_mode(face_container_, LV_SCROLLBAR_MODE_OFF);
++
++    auto make_solid = [](lv_obj_t* obj, lv_color_t color) {
++        lv_obj_set_style_bg_color(obj, color, 0);
++        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
++        lv_obj_set_style_border_width(obj, 0, 0);
++        lv_obj_set_style_outline_width(obj, 0, 0);
++        lv_obj_set_style_shadow_width(obj, 0, 0);
++        lv_obj_set_style_pad_all(obj, 0, 0);
++        lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, 0);
++        lv_obj_set_style_transform_pivot_x(obj, LV_PCT(50), 0);
++        lv_obj_set_style_transform_pivot_y(obj, LV_PCT(50), 0);
++        lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
++    };
++
++    auto make_block = [](lv_obj_t* obj, lv_color_t color) {
++        lv_obj_set_style_bg_color(obj, color, 0);
++        lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
++        lv_obj_set_style_border_width(obj, 0, 0);
++        lv_obj_set_style_outline_width(obj, 0, 0);
++        lv_obj_set_style_shadow_width(obj, 0, 0);
++        lv_obj_set_style_pad_all(obj, 0, 0);
++        lv_obj_set_style_radius(obj, 0, 0);
++        lv_obj_set_style_transform_pivot_x(obj, LV_PCT(50), 0);
++        lv_obj_set_style_transform_pivot_y(obj, LV_PCT(50), 0);
++        lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
++    };
++
++    auto hide = [](lv_obj_t* obj) { lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN); };
++
++    // The panel lights up dark LVGL pixels: black features glow on the screen.
++    eye_left_ = lv_obj_create(face_container_);
++    eye_right_ = lv_obj_create(face_container_);
++    make_solid(eye_left_, lv_color_black());
++    make_solid(eye_right_, lv_color_black());
++
++    // Smile eyes: explicit "^" polylines, clearer than a tilted bar.
++    smile_l_ = lv_line_create(face_container_);
++    smile_r_ = lv_line_create(face_container_);
++    for (int i = 0; i < 2; i++) {
++        lv_obj_t* line = (i == 0) ? smile_l_ : smile_r_;
++        lv_obj_set_style_bg_opa(line, LV_OPA_TRANSP, 0);
++        lv_obj_set_style_border_width(line, 0, 0);
++        lv_obj_set_style_pad_all(line, 0, 0);
++        lv_obj_set_style_line_width(line, 3, 0);
++        lv_obj_set_style_line_rounded(line, true, 0);
++        lv_obj_set_style_line_color(line, lv_color_black(), 0);
++        hide(line);
++    }
++
++    // Eyebrows: short bars above the eyes, tilted per expression.
++    brow_left_ = lv_obj_create(face_container_);
++    brow_right_ = lv_obj_create(face_container_);
++    make_solid(brow_left_, lv_color_black());
++    make_solid(brow_right_, lv_color_black());
++    lv_obj_set_size(brow_left_, 11, 2);
++    lv_obj_set_size(brow_right_, 11, 2);
++    hide(brow_left_);
++    hide(brow_right_);
++
++    // Blush: two small dots on the cheeks.
++    blush_left_ = lv_obj_create(face_container_);
++    blush_right_ = lv_obj_create(face_container_);
++    make_solid(blush_left_, lv_color_black());
++    make_solid(blush_right_, lv_color_black());
++    lv_obj_set_size(blush_left_, 5, 5);
++    lv_obj_set_size(blush_right_, 5, 5);
++    hide(blush_left_);
++    hide(blush_right_);
++
++    // Tears: two drops per side for a full stream.
++    lv_obj_t* tears[4] = {nullptr, nullptr, nullptr, nullptr};
++    lv_obj_t** tear_slots[4] = {&tear_left_, &tear_left2_, &tear_right_, &tear_right2_};
++    for (int i = 0; i < 4; i++) {
++        tears[i] = lv_obj_create(face_container_);
++        make_solid(tears[i], lv_color_black());
++        lv_obj_set_size(tears[i], 3, 4);
++        hide(tears[i]);
++        *tear_slots[i] = tears[i];
++    }
++
++    // Sweat drop at the temple.
++    sweat_ = lv_obj_create(face_container_);
++    make_solid(sweat_, lv_color_black());
++    lv_obj_set_size(sweat_, 4, 6);
++    hide(sweat_);
++
++    // Floating hearts: two round lobes plus a diamond tip.
++    for (int h = 0; h < 2; h++) {
++        for (int l = 0; l < 2; l++) {
++            heart_lobe_[h][l] = lv_obj_create(face_container_);
++            make_solid(heart_lobe_[h][l], lv_color_black());
++            lv_obj_set_size(heart_lobe_[h][l], 5, 5);
++            hide(heart_lobe_[h][l]);
++        }
++        heart_tip_[h] = lv_obj_create(face_container_);
++        make_block(heart_tip_[h], lv_color_black());
++        lv_obj_set_size(heart_tip_[h], 6, 6);
++        lv_obj_set_style_transform_rotation(heart_tip_[h], 450, 0);
++        hide(heart_tip_[h]);
++    }
++
++    // Sparkles: small diamonds that blink around the head.
++    for (int i = 0; i < 3; i++) {
++        sparkle_[i] = lv_obj_create(face_container_);
++        make_block(sparkle_[i], lv_color_black());
++        lv_obj_set_size(sparkle_[i], 5, 5);
++        lv_obj_set_style_transform_rotation(sparkle_[i], 450, 0);
++        hide(sparkle_[i]);
++    }
++
++    // Exclamation mark for shock.
++    exclaim_bar_ = lv_obj_create(face_container_);
++    make_solid(exclaim_bar_, lv_color_black());
++    lv_obj_set_size(exclaim_bar_, 3, 9);
++    hide(exclaim_bar_);
++    exclaim_dot_ = lv_obj_create(face_container_);
++    make_solid(exclaim_dot_, lv_color_black());
++    lv_obj_set_size(exclaim_dot_, 3, 3);
++    hide(exclaim_dot_);
++
++    // Question mark for confusion.
++    question_ = lv_label_create(face_container_);
++    lv_obj_set_style_text_font(question_, &BUILTIN_TEXT_FONT, 0);
++    lv_obj_set_style_text_color(question_, lv_color_black(), 0);
++    lv_label_set_text(question_, "?");
++    hide(question_);
++
++    // Anger mark: two crossing strokes at the temple.
++    anger_a_ = lv_line_create(face_container_);
++    anger_b_ = lv_line_create(face_container_);
++    for (int i = 0; i < 2; i++) {
++        lv_obj_t* line = (i == 0) ? anger_a_ : anger_b_;
++        lv_obj_set_style_bg_opa(line, LV_OPA_TRANSP, 0);
++        lv_obj_set_style_border_width(line, 0, 0);
++        lv_obj_set_style_pad_all(line, 0, 0);
++        lv_obj_set_style_line_width(line, 2, 0);
++        lv_obj_set_style_line_rounded(line, true, 0);
++        lv_obj_set_style_line_color(line, lv_color_black(), 0);
++        hide(line);
++    }
++    anger_pts_a_[0] = {0, 0};
++    anger_pts_a_[1] = {9, 9};
++    anger_pts_b_[0] = {0, 9};
++    anger_pts_b_[1] = {9, 0};
++    lv_line_set_points(anger_a_, anger_pts_a_, 2);
++    lv_line_set_points(anger_b_, anger_pts_b_, 2);
++
++    // Dizzy spiral above the head, spun by transform_rotation.
++    swirl_ = lv_line_create(face_container_);
++    lv_obj_set_style_bg_opa(swirl_, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(swirl_, 0, 0);
++    lv_obj_set_style_pad_all(swirl_, 0, 0);
++    lv_obj_set_style_line_width(swirl_, 2, 0);
++    lv_obj_set_style_line_rounded(swirl_, true, 0);
++    lv_obj_set_style_line_color(swirl_, lv_color_black(), 0);
++    for (int i = 0; i < 16; i++) {
++        float a = i * 0.95f;
++        float r = 1.2f + i * 0.5f;
++        swirl_pts_[i].x = 9 + (int)(cosf(a) * r);
++        swirl_pts_[i].y = 9 + (int)(sinf(a) * r);
++    }
++    lv_line_set_points(swirl_, swirl_pts_, 16);
++    hide(swirl_);
++
++    // Mouth: a line for smiles/frowns, a small filled ellipse for open mouths.
++    mouth_line_ = lv_line_create(face_container_);
++    lv_obj_set_style_bg_opa(mouth_line_, LV_OPA_TRANSP, 0);
++    lv_obj_set_style_border_width(mouth_line_, 0, 0);
++    lv_obj_set_style_pad_all(mouth_line_, 0, 0);
++    lv_obj_set_style_line_width(mouth_line_, 3, 0);
++    lv_obj_set_style_line_rounded(mouth_line_, true, 0);
++    lv_obj_set_style_line_color(mouth_line_, lv_color_black(), 0);
++    hide(mouth_line_);
++
++    mouth_fill_ = lv_obj_create(face_container_);
++    make_solid(mouth_fill_, lv_color_black());
++    hide(mouth_fill_);
++
++    // Tongue poking out of a silly mouth.
++    tongue_ = lv_obj_create(face_container_);
++    make_solid(tongue_, lv_color_black());
++    lv_obj_set_size(tongue_, 6, 4);
++    hide(tongue_);
++
++    // Small "thought" dots floating up and to the right of the head.
++    static const int16_t DOT_X[3] = {71, 78, 85};
++    static const int16_t DOT_Y[3] = {13, 7, 1};
++    static const int16_t DOT_D[3] = {3, 3, 4};
++    for (int i = 0; i < 3; i++) {
++        thought_dots_[i] = lv_obj_create(face_container_);
++        make_solid(thought_dots_[i], lv_color_black());
++        lv_obj_set_size(thought_dots_[i], DOT_D[i], DOT_D[i]);
++        lv_obj_set_pos(thought_dots_[i], DOT_X[i], DOT_Y[i]);
++        hide(thought_dots_[i]);
++    }
++
++    // Sleeping "z z Z" in the upper right. Use the static built-in font: the
++    // theme's font wrapper is replaced (and freed) when the asset theme
++    // refreshes at boot, which must not leave a dangling style pointer.
++    static const int16_t Z_X[3] = {98, 104, 110};
++    static const int16_t Z_Y[3] = {4, 12, 20};
++    static const char* Z_CH[3] = {"z", "z", "Z"};
++    for (int i = 0; i < 3; i++) {
++        zzz_labels_[i] = lv_label_create(face_container_);
++        lv_obj_set_style_text_font(zzz_labels_[i], &BUILTIN_TEXT_FONT, 0);
++        // Black text glows on the dark screen.
++        lv_obj_set_style_text_color(zzz_labels_[i], lv_color_black(), 0);
++        lv_label_set_text(zzz_labels_[i], Z_CH[i]);
++        lv_obj_set_pos(zzz_labels_[i], Z_X[i], Z_Y[i]);
++        lv_obj_add_flag(zzz_labels_[i], LV_OBJ_FLAG_HIDDEN);
++    }
++
++    face_ = face_target_;
++    ComputeFacePose(face_, eye_cur_l_, eye_cur_r_);
++    eye_dst_l_ = eye_cur_l_;
++    eye_dst_r_ = eye_cur_r_;
++    face_ready_ = true;
++
++    tick_ = 0;
++    blink_at_ = 40 + esp_random() % 40;
++    blink_end_ = 0;
++    next_gaze_tick_ = 20;
++    next_bounce_tick_ = 200 + esp_random() % 200;
++    next_idle_event_ = 100 + esp_random() % 120;
++    emotion_hold_until_ = 0;
++
++    ApplyFacePose();
++    face_timer_ = lv_timer_create(FaceTimerCb, 50, this);
++}
++
++void OledDisplay::SetFace(Face face) {
++    face_target_ = face;
++}
++
++// Two small eyes. Idle is two plain circles; other faces stretch the same
++// circles into ellipses, capsules, arcs and lines, with deliberate left/right
++// asymmetry, so each expression reads at a glance.
++void OledDisplay::ComputeFacePose(Face face, EyePose& left, EyePose& right) {
++    switch (face) {
++        case Face::LISTENING:
++            left = {18, 20, 0, -1, -1};
++            right = {17, 20, 0, 1, -1};
++            break;
++        case Face::SPEAKING:
++            left = {15, 17, 0, -1, 0};
++            right = {15, 15, 0, 1, 0};
++            break;
++        case Face::HAPPY:
++            // Eyes bent upward into gentle smile arcs.
++            left = {14, 3, -10, 0, -1};
++            right = {14, 3, 10, 0, -1};
++            break;
++        case Face::LAUGHING:
++            // Closed eyes bent upward into "^ ^".
++            left = {12, 3, -18, 0, -1};
++            right = {12, 3, 18, 1, -1};
++            break;
++        case Face::LOVING:
++            left = {19, 19, 0, -1, -2};
++            right = {18, 18, 0, 1, -2};
++            break;
++        case Face::KISSY:
++            left = {12, 3, -8, 0, 0};
++            right = {12, 3, 8, 0, 0};
++            break;
++        case Face::WINKING:
++            left = {16, 16, 0, -1, 0};
++            right = {14, 3, 8, 1, 0};
++            break;
++        case Face::SILLY:
++            left = {22, 22, 0, -2, 0};
++            right = {13, 13, 0, 2, 1};
++            break;
++        case Face::DELICIOUS:
++            left = {12, 3, -15, 0, 0};
++            right = {12, 3, 15, 0, 0};
++            break;
++        case Face::CONFIDENT:
++            left = {17, 7, -6, -1, 1};
++            right = {16, 7, 5, 1, 1};
++            break;
++        case Face::SAD:
++            left = {17, 7, -6, 0, 3};
++            right = {13, 7, 6, 2, 3};
++            break;
++        case Face::CRYING:
++            left = {17, 5, -8, 0, 3};
++            right = {14, 5, 8, 1, 3};
++            break;
++        case Face::ANGRY:
++            left = {12, 17, -25, -1, 0};
++            right = {12, 17, 25, 1, 0};
++            break;
++        case Face::SLEEPY:
++            left = {18, 5, -6, 0, 3};
++            right = {16, 5, 5, 0, 3};
++            break;
++        case Face::TIRED:
++            left = {16, 7, 0, 0, 2};
++            right = {14, 7, 0, 0, 3};
++            break;
++        case Face::RELAXED:
++            left = {16, 6, -6, 0, 2};
++            right = {14, 6, 5, 0, 2};
++            break;
++        case Face::THINKING:
++            // Both eyes look up and to one side; one eye narrows.
++            left = {13, 16, 0, 2, -3};
++            right = {12, 10, 0, 3, -2};
++            break;
++        case Face::SURPRISED:
++            left = {22, 22, 0, -1, -1};
++            right = {20, 20, 0, 1, -1};
++            break;
++        case Face::SHOCKED:
++            left = {23, 23, 0, -1, -2};
++            right = {21, 21, 0, 1, -2};
++            break;
++        case Face::CONFUSED:
++            left = {14, 16, 0, -1, -1};
++            right = {17, 6, 0, 2, 2};
++            break;
++        case Face::DIZZY:
++            left = {14, 14, 0, -2, 0};
++            right = {14, 14, 0, 2, 1};
++            break;
++        case Face::SHY:
++            left = {11, 13, 0, -2, 1};
++            right = {11, 12, 0, -1, 2};
++            break;
++        case Face::EMBARRASSED:
++            left = {14, 5, -10, 0, 2};
++            right = {14, 5, 10, 1, 2};
++            break;
++        case Face::IDLE:
++        default:
++            left = {16, 16, 0, -1, 0};
++            right = {14, 15, 0, 1, 1};
++            break;
++    }
++}
++
++void OledDisplay::ApplyMouth(Face face, int bob) {
++    Face mface = face;
++    if (mface == Face::IDLE) {
++        if (listening_) {
++            mface = Face::LISTENING;
++        } else if (speaking_) {
++            mface = Face::SPEAKING;
++        }
++    }
++
++    const int cx = kMouthCx + shake_x_;
++    const int cy = kMouthCy + bob;
++
++    auto show_line = [&]() {
++        lv_obj_remove_flag(mouth_line_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_add_flag(mouth_fill_, LV_OBJ_FLAG_HIDDEN);
++    };
++    auto show_fill = [&](int w, int h) {
++        lv_obj_add_flag(mouth_line_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_remove_flag(mouth_fill_, LV_OBJ_FLAG_HIDDEN);
++        lv_obj_set_size(mouth_fill_, w, h);
++        lv_obj_set_pos(mouth_fill_, cx - w / 2, cy - h / 2);
++    };
++    // Positive depth = smile, negative = frown.
++    auto curve = [&](int half, int depth, int dx = 0) {
++        show_line();
++        static const int fx[5] = {-4, -2, 0, 2, 4};
++        static const int fy[5] = {0, 3, 4, 3, 0};
++        for (int i = 0; i < 5; i++) {
++            mouth_pts_[i].x = cx + dx + fx[i] * half / 4;
++            mouth_pts_[i].y = cy + fy[i] * depth / 4;
++        }
++        lv_line_set_points(mouth_line_, mouth_pts_, 5);
++    };
++    auto line = [&](int half, int dx) {
++        show_line();
++        mouth_pts_[0].x = cx + dx - half;
++        mouth_pts_[0].y = cy;
++        mouth_pts_[1].x = cx + dx + half;
++        mouth_pts_[1].y = cy;
++        lv_line_set_points(mouth_line_, mouth_pts_, 2);
++    };
++    auto wave = [&](int half) {
++        show_line();
++        static const int wx[5] = {-4, -2, 0, 2, 4};
++        static const int wy[5] = {-1, 2, -2, 2, -1};
++        for (int i = 0; i < 5; i++) {
++            mouth_pts_[i].x = cx + wx[i] * half / 4;
++            mouth_pts_[i].y = cy + wy[i];
++        }
++        lv_line_set_points(mouth_line_, mouth_pts_, 5);
++    };
++
++    lv_obj_add_flag(tongue_, LV_OBJ_FLAG_HIDDEN);
++
++    switch (mface) {
++        case Face::LISTENING:
++            line(7, 0);
++            break;
++        case Face::SPEAKING: {
++            int h = 4 + (int)(fabsf(sinf(tick_ * 0.45f)) * 6.0f);
++            show_fill(14, h);
++            break;
++        }
++        case Face::HAPPY:
++            show_fill(18, 11);
++            break;
++        case Face::LAUGHING:
++            show_fill(21, 13);
++            break;
++        case Face::LOVING:
++            curve(10, 3);
++            break;
++        case Face::KISSY:
++            show_fill(7, 7);
++            break;
++        case Face::WINKING:
++            curve(10, 3, 2);
++            break;
++        case Face::SILLY:
++            show_fill(15, 11);
++            lv_obj_set_size(tongue_, 7, 5);
++            lv_obj_set_pos(tongue_, cx - 3, cy + 6);
++            lv_obj_remove_flag(tongue_, LV_OBJ_FLAG_HIDDEN);
++            break;
++        case Face::DELICIOUS: {
++            int h = 5 + (int)(fabsf(sinf(tick_ * 0.6f)) * 5.0f);
++            show_fill(16, h);
++            break;
++        }
++        case Face::CONFIDENT:
++            curve(9, 3, 2);
++            break;
++        case Face::SAD:
++            curve(9, -4);
++            break;
++        case Face::CRYING:
++            curve(11, -5);
++            break;
++        case Face::ANGRY:
++            line(8, 0);
++            break;
++        case Face::SLEEPY:
++            show_fill(6, 5);
++            break;
++        case Face::TIRED:
++            line(7, 0);
++            break;
++        case Face::RELAXED:
++            curve(9, 3);
++            break;
++        case Face::THINKING:
++            line(5, 4);
++            break;
++        case Face::SURPRISED:
++            show_fill(10, 11);
++            break;
++        case Face::SHOCKED:
++            show_fill(12, 14);
++            break;
++        case Face::CONFUSED:
++            wave(10);
++            break;
++        case Face::DIZZY:
++            wave(11);
++            break;
++        case Face::SHY:
++            curve(8, 3);
++            break;
++        case Face::EMBARRASSED:
++            wave(8);
++            break;
++        case Face::IDLE:
++        default:
++            // Small idle variations so the standby face does not look frozen.
++            if (idle_event_ == 3) {
++                show_fill(12, 15);  // big yawn
++            } else if (idle_event_ == 4) {
++                curve(14, 5);       // wide grin
++            } else if (idle_event_ == 5) {
++                curve(10, 3, 3);    // lopsided smile while tilting
++            } else {
++                curve(10, 3);
++            }
++            break;
++    }
++}
++
++void OledDisplay::ApplyFacePose(int bob) {
++    if (!face_ready_) {
++        return;
++    }
++
++    auto set_visible = [](lv_obj_t* obj, bool visible) {
++        if (obj == nullptr) {
++            return;
++        }
++        if (visible) {
++            lv_obj_remove_flag(obj, LV_OBJ_FLAG_HIDDEN);
++        } else {
++            lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
++        }
++    };
++
++    const bool line_face = (face_ == Face::SLEEPY || face_ == Face::SAD ||
++                            face_ == Face::CRYING || face_ == Face::TIRED ||
++                            face_ == Face::KISSY || face_ == Face::DELICIOUS ||
++                            face_ == Face::EMBARRASSED);
++    const bool blink = (tick_ < blink_end_) && !line_face;
++
++    auto place_eye = [&](lv_obj_t* eye, int base_x, const EyePose& pose) {
++        int h = pose.h;
++        if (blink) {
++            h = 2;
++        }
++        int wobble = 0;
++        if (face_ == Face::DIZZY || face_ == Face::CONFUSED) {
++            wobble = (int)(sinf(tick_ * 0.8f + base_x * 0.06f) * 1.5f);
++        }
++        lv_obj_set_size(eye, pose.w, h);
++        lv_obj_set_pos(eye, base_x + pose.dx + gaze_x_ + shake_x_ - pose.w / 2,
++                       kEyeCy + pose.dy + gaze_y_ + bob + wobble - h / 2);
++        lv_obj_set_style_transform_rotation(eye, pose.tilt * 10, 0);
++    };
++
++    // Happy faces use explicit "^" smile arcs instead of solid eyes.
++    const bool smile_eyes = (face_ == Face::HAPPY || face_ == Face::LAUGHING ||
++                             face_ == Face::KISSY || face_ == Face::DELICIOUS);
++    int smile_half = 9, smile_peak = 6;
++    if (face_ == Face::LAUGHING) {
++        smile_peak = 8;
++    } else if (face_ == Face::KISSY) {
++        smile_half = 7;
++        smile_peak = 5;
++    } else if (face_ == Face::DELICIOUS) {
++        smile_half = 7;
++        smile_peak = 6;
++    }
++    set_visible(eye_left_, !smile_eyes);
++    set_visible(eye_right_, !smile_eyes);
++    set_visible(smile_l_, smile_eyes);
++    set_visible(smile_r_, smile_eyes);
++    if (smile_eyes) {
++        auto place_smile = [&](lv_obj_t* line, lv_point_precise_t* pts, int cx,
++                               int half) {
++            pts[0].x = 0;
++            pts[0].y = smile_peak;
++            pts[1].x = half;
++            pts[1].y = 0;
++            pts[2].x = half * 2;
++            pts[2].y = smile_peak;
++            lv_line_set_points(line, pts, 3);
++            lv_obj_set_pos(line, cx + gaze_x_ + shake_x_ - half,
++                           kEyeCy - 1 + gaze_y_ + bob - smile_peak / 2);
++        };
++        place_smile(smile_l_, smile_pts_l_, kEyeLx, smile_half);
++        place_smile(smile_r_, smile_pts_r_, kEyeRx, smile_half - 1);
++    } else {
++        place_eye(eye_left_, kEyeLx, eye_cur_l_);
++        place_eye(eye_right_, kEyeRx, eye_cur_r_);
++    }
++
++    // ---- Eyebrows ----
++    bool show_brows = true;
++    int bl_tilt = 0, br_tilt = 0, bl_y = 12, br_y = 12;
++    switch (face_) {
++        case Face::ANGRY:
++            bl_tilt = 15; br_tilt = -15;
++            break;
++        case Face::SAD:
++        case Face::CRYING:
++        case Face::EMBARRASSED:
++            bl_tilt = -15; br_tilt = 15;
++            break;
++        case Face::SURPRISED:
++        case Face::SHOCKED:
++            bl_y = 9; br_y = 9;
++            break;
++        case Face::CONFUSED:
++            bl_tilt = -12; bl_y = 11; br_y = 14;
++            break;
++        case Face::THINKING:
++            bl_y = 12; br_tilt = -15; br_y = 9;
++            break;
++        case Face::DIZZY:
++            bl_y = 12; br_y = 14;
++            break;
++        default:
++            show_brows = false;
++            break;
++    }
++    const bool idle_squint = (face_ == Face::IDLE && idle_event_ == 2);
++    if (idle_squint) {
++        show_brows = true;
++        bl_tilt = -12;
++        bl_y = 10;
++        br_y = 10;
++    }
++    set_visible(brow_left_, show_brows);
++    set_visible(brow_right_, show_brows && !idle_squint);
++    if (show_brows) {
++        lv_obj_set_pos(brow_left_, kEyeLx - 5 + shake_x_, bl_y + bob);
++        lv_obj_set_pos(brow_right_, kEyeRx - 6 + shake_x_, br_y + bob);
++        lv_obj_set_style_transform_rotation(brow_left_, bl_tilt * 10, 0);
++        lv_obj_set_style_transform_rotation(brow_right_, br_tilt * 10, 0);
++    }
++
++    // ---- Blush ----
++    const bool blush = (face_ == Face::SHY || face_ == Face::EMBARRASSED ||
++                        face_ == Face::LOVING || face_ == Face::KISSY ||
++                        face_ == Face::DELICIOUS);
++    set_visible(blush_left_, blush);
++    set_visible(blush_right_, blush);
++    if (blush) {
++        lv_obj_set_pos(blush_left_, 35 + shake_x_, 35 + bob);
++        lv_obj_set_pos(blush_right_, 93 + shake_x_, 35 + bob);
++    }
++
++    // ---- Tears ----
++    const bool crying = (face_ == Face::CRYING);
++    const bool sad = (face_ == Face::SAD);
++    const int lx = kEyeLx + eye_cur_l_.dx + shake_x_;
++    const int rx = kEyeRx + eye_cur_r_.dx + shake_x_;
++    auto place_tear = [&](lv_obj_t* tear, bool on, int x, int phase) {
++        set_visible(tear, on);
++        if (!on) {
++            return;
++        }
++        int y = 33 + (int)((tick_ + phase) % 18);
++        lv_obj_set_pos(tear, x, y + bob);
++    };
++    place_tear(tear_left_, crying || sad, lx - 7, 0);
++    place_tear(tear_left2_, crying, lx - 2, 9);
++    place_tear(tear_right_, crying, rx + 2, 4);
++    place_tear(tear_right2_, crying, rx + 7, 13);
++
++    // ---- Sweat ----
++    const bool sweat = (face_ == Face::TIRED || face_ == Face::EMBARRASSED ||
++                        face_ == Face::DIZZY || face_ == Face::SHOCKED ||
++                        face_ == Face::CONFUSED);
++    set_visible(sweat_, sweat);
++    if (sweat) {
++        int y = 15 + (int)(tick_ % 12);
++        lv_obj_set_pos(sweat_, 100 + shake_x_, y + bob);
++    }
++
++    // ---- Hearts ----
++    const bool hearts = (face_ == Face::LOVING || face_ == Face::KISSY);
++    for (int h = 0; h < 2; h++) {
++        int phase = (int)((tick_ + h * 14) % 40);
++        int x = 98 + h * 10 + (int)(sinf((tick_ + h * 8) * 0.2f) * 2.0f);
++        int y = 24 - phase / 2;
++        set_visible(heart_lobe_[h][0], hearts);
++        set_visible(heart_lobe_[h][1], hearts);
++        set_visible(heart_tip_[h], hearts);
++        if (hearts) {
++            lv_obj_set_pos(heart_lobe_[h][0], x - 4, y + bob);
++            lv_obj_set_pos(heart_lobe_[h][1], x + 1, y + bob);
++            lv_obj_set_pos(heart_tip_[h], x - 3, y + 2 + bob);
++        }
++    }
++
++    // ---- Sparkles ----
++    const bool sparkles = (face_ == Face::LAUGHING || face_ == Face::DELICIOUS ||
++                           face_ == Face::SURPRISED);
++    static const int16_t SP_X[3] = {36, 98, 64};
++    static const int16_t SP_Y[3] = {9, 7, 2};
++    for (int i = 0; i < 3; i++) {
++        bool on = sparkles && ((tick_ / 6 + i) % 3 != 2);
++        set_visible(sparkle_[i], on);
++        if (on) {
++            lv_obj_set_pos(sparkle_[i], SP_X[i] + shake_x_, SP_Y[i] + bob);
++        }
++    }
++
++    // ---- Exclamation / question ----
++    const bool exclaim = (face_ == Face::SHOCKED);
++    set_visible(exclaim_bar_, exclaim);
++    set_visible(exclaim_dot_, exclaim);
++    if (exclaim) {
++        int y = 4 + (int)(sinf(tick_ * 0.5f) * 2.0f);
++        lv_obj_set_pos(exclaim_bar_, 105 + shake_x_, y + bob);
++        lv_obj_set_pos(exclaim_dot_, 105 + shake_x_, y + 12 + bob);
++    }
++    const bool question = (face_ == Face::CONFUSED);
++    set_visible(question_, question);
++    if (question) {
++        int y = 3 + (int)(sinf(tick_ * 0.12f) * 1.5f);
++        lv_obj_set_pos(question_, 102, y + bob);
++    }
++
++    // ---- Anger mark ----
++    const bool anger = (face_ == Face::ANGRY);
++    set_visible(anger_a_, anger);
++    set_visible(anger_b_, anger);
++    if (anger) {
++        int jitter = (int)((tick_ / 3) % 2);
++        lv_obj_set_pos(anger_a_, 100 + jitter + shake_x_, 8 + bob);
++        lv_obj_set_pos(anger_b_, 100 + jitter + shake_x_, 8 + bob);
++    }
++
++    // ---- Dizzy spiral ----
++    // "confused" is the emotion the server most often sends for a dizzy reply,
++    // so it gets the same spiral, wobble and sweat as "dizzy".
++    const bool dizzy = (face_ == Face::DIZZY || face_ == Face::CONFUSED);
++    set_visible(swirl_, dizzy);
++    if (dizzy) {
++        lv_obj_set_pos(swirl_, 55 + shake_x_, 1 + bob);
++        lv_obj_set_style_transform_rotation(swirl_, (int)(tick_ * 12), 0);
++    }
++
++    // ---- Thought dots ----
++    const bool thinking = (face_ == Face::THINKING);
++    static const int16_t DOT_X[3] = {71, 78, 85};
++    for (int i = 0; i < 3; i++) {
++        bool on = thinking && ((tick_ / 8 + i) % 3 != 2);
++        set_visible(thought_dots_[i], on);
++        if (on) {
++            int y = 13 - i * 6 + bob - (int)(sinf((tick_ + i * 12) * 0.1f) * 1.5f);
++            lv_obj_set_pos(thought_dots_[i], DOT_X[i], y);
++        }
++    }
++
++    // ---- Sleep Z's ----
++    const bool sleepy = (face_ == Face::SLEEPY);
++    for (int i = 0; i < 3; i++) {
++        set_visible(zzz_labels_[i], sleepy);
++        if (sleepy) {
++            int y = 4 + i * 8 + bob - (int)(sinf((tick_ + i * 14) * 0.08f) * 2.0f);
++            static const int16_t zx[3] = {98, 104, 110};
++            lv_obj_set_pos(zzz_labels_[i], zx[i], y);
++        }
++    }
++
++    ApplyMouth(face_, bob);
++}
++
++void OledDisplay::UpdateFace() {
++    // Keep an expressive face for the whole reply plus a few seconds after it.
++    const uint32_t now_ms = lv_tick_get();
++    if (speaking_ && face_ != Face::IDLE) {
++        emotion_hold_until_ = now_ms + 6000;
++    }
++    if (face_ != Face::IDLE && !speaking_ &&
++        (int32_t)(now_ms - emotion_hold_until_) >= 0) {
++        face_target_ = Face::IDLE;
++    }
++
++    if (face_ != face_target_) {
++        face_ = face_target_;
++        if (face_ == Face::HAPPY || face_ == Face::LAUGHING ||
++            face_ == Face::LOVING || face_ == Face::SILLY ||
++            face_ == Face::DELICIOUS || face_ == Face::WINKING ||
++            face_ == Face::SURPRISED || face_ == Face::SHOCKED) {
++            bounce_end_ = tick_ + 14;
++        }
++        blink_at_ = tick_ + 30;
++        next_gaze_tick_ = tick_ + 20;
++    }
++
++    Face pose_face = face_;
++    if (face_ == Face::IDLE) {
++        if (listening_) {
++            pose_face = Face::LISTENING;
++        } else if (speaking_) {
++            pose_face = Face::SPEAKING;
++        }
++    }
++    ComputeFacePose(pose_face, eye_dst_l_, eye_dst_r_);
++
++    // Idle micro-animations: every 5-15 seconds the standby face does a small
++    // gesture (glance aside, squint, yawn, grin, tilt) for a second or two.
++    const bool idle_like = (pose_face == Face::IDLE);
++    if (idle_like) {
++        if (idle_event_ == 0 && tick_ >= next_idle_event_) {
++            idle_event_ = 1 + esp_random() % 5;
++            idle_event_until_ = tick_ + 60 + esp_random() % 60;  // 3-6 s
++            if (idle_event_ == 1) {
++                gaze_target_x_ = (esp_random() % 2 == 0) ? 5 : -5;
++                gaze_target_y_ = 0;
++            }
++        }
++        if (idle_event_ != 0 && tick_ >= idle_event_until_) {
++            idle_event_ = 0;
++            next_idle_event_ = tick_ + 100 + esp_random() % 120;
++        }
++        if (idle_event_ == 2) {
++            // Curious squint: one eye flattens and a brow lifts.
++            eye_dst_l_ = {11, 4, 0, -1, 0};
++            eye_dst_r_ = {14, 16, 0, 2, -1};
++            gaze_target_x_ = 3;
++            gaze_target_y_ = 0;
++        } else if (idle_event_ == 3) {
++            // Yawn: both eyes squeeze shut while the mouth opens wide.
++            eye_dst_l_ = {13, 3, -8, 0, 1};
++            eye_dst_r_ = {12, 3, 8, 1, 1};
++            gaze_target_x_ = 0;
++            gaze_target_y_ = 0;
++        } else if (idle_event_ == 4) {
++            // Grin: the eyes crinkle a little too.
++            eye_dst_l_ = {14, 9, 0, -1, 0};
++            eye_dst_r_ = {13, 8, 0, 1, 1};
++        } else if (idle_event_ == 5) {
++            // Noticeable head tilt: eyes offset vertically, mouth slides over.
++            eye_dst_l_.dy = -3;
++            eye_dst_r_.dy = 2;
++            eye_dst_l_.dx = -1;
++            eye_dst_r_.dx = 2;
++        }
++    } else {
++        idle_event_ = 0;
++    }
++
++    auto approach = [](int& value, int target) {
++        if (value < target) {
++            value += (target - value + 1) / 2;
++        } else if (value > target) {
++            value -= (value - target + 1) / 2;
++        }
++    };
++
++    // Look around while idle, listening or talking.
++    const bool wander = (pose_face == Face::IDLE || pose_face == Face::LISTENING ||
++                         pose_face == Face::SPEAKING);
++    if (wander && idle_event_ == 0 && tick_ >= next_gaze_tick_) {
++        gaze_target_x_ = (int)(esp_random() % 5) - 2;
++        gaze_target_y_ = (int)(esp_random() % 3) - 1;
++        next_gaze_tick_ = tick_ + 40 + esp_random() % 60;
++    } else if (!wander) {
++        gaze_target_x_ = 0;
++        gaze_target_y_ = 0;
++    }
++    if (pose_face == Face::SPEAKING) {
++        gaze_target_x_ = (int)(sinf(tick_ * 0.18f) * 2.0f);
++    }
++    approach(gaze_x_, gaze_target_x_);
++    approach(gaze_y_, gaze_target_y_);
++
++    const bool line_face = (pose_face == Face::SLEEPY || pose_face == Face::SAD ||
++                            pose_face == Face::CRYING || pose_face == Face::TIRED ||
++                            pose_face == Face::KISSY || pose_face == Face::DELICIOUS ||
++                            pose_face == Face::EMBARRASSED);
++    if (tick_ >= blink_at_) {
++        if (!line_face) {
++            blink_end_ = tick_ + 3;
++        }
++        blink_at_ = tick_ + 60 + esp_random() % 80;
++    }
++
++    if (pose_face == Face::IDLE && tick_ >= next_bounce_tick_) {
++        bounce_end_ = tick_ + 14;
++        next_bounce_tick_ = tick_ + 200 + esp_random() % 200;
++    }
++
++    // Jitter for tense or unstable expressions.
++    if (pose_face == Face::ANGRY) {
++        shake_x_ = ((tick_ / 3) % 2 == 0) ? 1 : -1;
++    } else if (pose_face == Face::SHOCKED) {
++        shake_x_ = (int)(sinf(tick_ * 0.9f) * 1.5f);
++    } else if (pose_face == Face::DIZZY || pose_face == Face::CONFUSED) {
++        shake_x_ = (int)(sinf(tick_ * 0.5f) * 2.0f);
++    } else {
++        shake_x_ = 0;
++    }
++
++    approach(eye_cur_l_.w, eye_dst_l_.w);
++    approach(eye_cur_l_.h, eye_dst_l_.h);
++    approach(eye_cur_l_.tilt, eye_dst_l_.tilt);
++    approach(eye_cur_l_.dx, eye_dst_l_.dx);
++    approach(eye_cur_l_.dy, eye_dst_l_.dy);
++    approach(eye_cur_r_.w, eye_dst_r_.w);
++    approach(eye_cur_r_.h, eye_dst_r_.h);
++    approach(eye_cur_r_.tilt, eye_dst_r_.tilt);
++    approach(eye_cur_r_.dx, eye_dst_r_.dx);
++    approach(eye_cur_r_.dy, eye_dst_r_.dy);
++
++    int bob = (int)(sinf(tick_ * 0.06f) * 1.4f);
++    if (tick_ < bounce_end_) {
++        float p = (float)(bounce_end_ - tick_) / 14.0f;
++        bob -= (int)(sinf(p * 3.14159f) * 3.0f);
++    }
++    ApplyFacePose(bob);
++}
++
++void OledDisplay::FaceTimerCb(lv_timer_t* timer) {
++    auto self = static_cast<OledDisplay*>(lv_timer_get_user_data(timer));
++    if (self == nullptr || self->text_mode_ || self->face_container_ == nullptr) {
++        return;
++    }
++    self->tick_++;
++    self->UpdateFace();
++}
++
++void OledDisplay::NotificationTimerCb(lv_timer_t* timer) {
++    auto self = static_cast<OledDisplay*>(lv_timer_get_user_data(timer));
++    if (self == nullptr) {
++        return;
++    }
++    self->eyes_timer_ = nullptr;
++    self->notification_active_ = false;
++    self->SetTextModeInternal(self->status_hold_);
++}
++
+ void OledDisplay::SetPowerSaveMode(bool on) {
+     if (panel_) {
+         Settings settings("wifi", false);
+diff --git a/main/display/oled_display.h b/main/display/oled_display.h
+index 1af05b9..516a05e 100644
+--- a/main/display/oled_display.h
++++ b/main/display/oled_display.h
+@@ -21,11 +21,127 @@ private:
+     lv_obj_t* emotion_label_ = nullptr;
+     lv_obj_t* chat_message_label_ = nullptr;
+ 
++    // Face layer: two small eyes, a small mouth, and optional decorations
++    // (brows, blush, tears, sweat, hearts, sparkles, anger mark, dizzy dots,
++    // "?" and "!"). The OLED panel lights up dark LVGL pixels, so everything is
++    // drawn dark and glows.
++    enum class Face : uint8_t {
++        IDLE,
++        LISTENING,
++        SPEAKING,
++        HAPPY,
++        LAUGHING,
++        LOVING,
++        KISSY,
++        WINKING,
++        SILLY,
++        DELICIOUS,
++        CONFIDENT,
++        SAD,
++        CRYING,
++        ANGRY,
++        SLEEPY,
++        TIRED,
++        RELAXED,
++        THINKING,
++        SURPRISED,
++        SHOCKED,
++        CONFUSED,
++        DIZZY,
++        SHY,
++        EMBARRASSED
++    };
++
++    struct EyePose {
++        int w = 13;      // eye width
++        int h = 13;      // eye height
++        int tilt = 0;    // degrees, positive = clockwise
++        int dx = 0;      // offset from the eye's base center
++        int dy = 0;
++    };
++
++    lv_obj_t* face_container_ = nullptr;
++    lv_obj_t* eye_left_ = nullptr;
++    lv_obj_t* eye_right_ = nullptr;
++    lv_obj_t* smile_l_ = nullptr;   // "^" eyes for happy faces
++    lv_obj_t* smile_r_ = nullptr;
++    lv_point_precise_t smile_pts_l_[3] = {};
++    lv_point_precise_t smile_pts_r_[3] = {};
++
++    // Decorations
++    lv_obj_t* brow_left_ = nullptr;
++    lv_obj_t* brow_right_ = nullptr;
++    lv_obj_t* blush_left_ = nullptr;
++    lv_obj_t* blush_right_ = nullptr;
++    lv_obj_t* tear_left_ = nullptr;
++    lv_obj_t* tear_left2_ = nullptr;
++    lv_obj_t* tear_right_ = nullptr;
++    lv_obj_t* tear_right2_ = nullptr;
++    lv_obj_t* sweat_ = nullptr;
++    lv_obj_t* heart_lobe_[2][2] = {};
++    lv_obj_t* heart_tip_[2] = {};
++    lv_obj_t* sparkle_[3] = {};
++    lv_obj_t* exclaim_bar_ = nullptr;
++    lv_obj_t* exclaim_dot_ = nullptr;
++    lv_obj_t* question_ = nullptr;
++    lv_obj_t* anger_a_ = nullptr;
++    lv_obj_t* anger_b_ = nullptr;
++    lv_point_precise_t anger_pts_a_[2] = {};
++    lv_point_precise_t anger_pts_b_[2] = {};
++    lv_obj_t* swirl_ = nullptr;
++    lv_point_precise_t swirl_pts_[16] = {};
++
++    // Mouth
++    lv_obj_t* mouth_line_ = nullptr;
++    lv_obj_t* mouth_fill_ = nullptr;
++    lv_obj_t* tongue_ = nullptr;
++    lv_point_precise_t mouth_pts_[5] = {};
++
++    lv_obj_t* thought_dots_[3] = {nullptr, nullptr, nullptr};
++    lv_obj_t* zzz_labels_[3] = {nullptr, nullptr, nullptr};
++    lv_timer_t* face_timer_ = nullptr;
++    lv_timer_t* eyes_timer_ = nullptr;
++    bool text_mode_ = false;          // true: show original text UI instead of eyes
++    bool status_hold_ = false;        // true: a non-normal status (provisioning/activation)
++    bool notification_active_ = false;
++    bool face_ready_ = false;
++    Face face_ = Face::IDLE;
++    Face face_target_ = Face::IDLE;
++    bool speaking_ = false;
++    bool listening_ = false;
++
++    EyePose eye_cur_l_, eye_cur_r_;  // eased geometry actually drawn
++    EyePose eye_dst_l_, eye_dst_r_;  // target geometry for the current face
++    int gaze_x_ = 0;
++    int gaze_y_ = 0;
++    int gaze_target_x_ = 0;
++    int gaze_target_y_ = 0;
++    int shake_x_ = 0;                // jitter for angry / shocked / dizzy
++    uint8_t idle_event_ = 0;         // 0 none, 1 look, 2 squint, 3 yawn, 4 smile, 5 tilt
++    uint32_t idle_event_until_ = 0;
++    uint32_t next_idle_event_ = 0;
++    uint32_t next_gaze_tick_ = 0;
++    uint32_t tick_ = 0;
++    uint32_t blink_at_ = 0;
++    uint32_t blink_end_ = 0;
++    uint32_t bounce_end_ = 0;
++    uint32_t next_bounce_tick_ = 0;
++    uint32_t emotion_hold_until_ = 0;  // keep the last expression visible until this time
++
+     virtual bool Lock(int timeout_ms = 0) override;
+     virtual void Unlock() override;
+ 
+     void SetupUI_128x64();
+     void SetupUI_128x32();
++    void SetupFace();
++    void SetTextModeInternal(bool on);
++    void SetFace(Face face);
++    void ComputeFacePose(Face face, EyePose& left, EyePose& right);
++    void ApplyMouth(Face face, int bob);
++    void ApplyFacePose(int bob = 0);
++    void UpdateFace();
++    static void FaceTimerCb(lv_timer_t* timer);
++    static void NotificationTimerCb(lv_timer_t* timer);
+ 
+ public:
+     OledDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_t panel, int width,
+@@ -33,6 +149,8 @@ public:
+     ~OledDisplay();
+ 
+     virtual void SetupUI() override;
++    virtual void SetStatus(const char* status) override;
++    virtual void ShowNotification(const char* notification, int duration_ms = 3000) override;
+     virtual void SetChatMessage(const char* role, const char* content) override;
+     virtual void SetEmotion(const char* emotion) override;
+     virtual void SetTheme(Theme* theme) override;
